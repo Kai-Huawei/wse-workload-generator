@@ -1,9 +1,20 @@
 __pycache__
 .vscode/launch.json
 
-output/
+# Ignore everything inside output/ and its subdirectories
+output/**
+!output/
+!output/**/
+!output/visuals/.gitkeep
 
-logs/
+# Ignore everything inside logs/ and its subdirectories
+logs/**
+!logs/
+!logs/**/
+
+# Track only the .gitkeep files
+!logs/.gitkeep
+!logs/core_level/.gitkeep
 
 out.log
 
@@ -11,4 +22,3 @@ out.log
 
 wafer.png
 autotile.png
-
