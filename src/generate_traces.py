@@ -21,6 +21,7 @@ from src.core_level.layers.barrier import Barrier
 
 from src.core_level.common.graph import init_graph
 from src.core_level.common.tile import load_tiling_config
+from src.Kai_Library.mapping_log import set_output_files, log_layer #KAI
 
 def generate_traces(args):
     init_logger(level=args.log.upper(), path='logs/generate_traces.log')
@@ -301,6 +302,8 @@ def generate_traces(args):
                 # raise NotImplementedError
                 logging.warning("Operation {} not recognized.".format(row["operation"]))
 
+    set_output_files(memory_csv=f"{args.outdir}/mapping/memory.csv", core_csv=f"{args.outdir}/mapping/cores.csv", iteration=args.iter) #KAI
+
     # Layer categories for cross-layer barrier insertion
     INSTRUCTION_PRODUCING_LAYERS = {
         LinearLayer, GroupedLinearLayer, MLALayer, Sum,
@@ -341,6 +344,8 @@ def generate_traces(args):
                     Barrier(barrier_id, all_cores).map_to_core(core)
 
         layer = layer_class(**layer_params)
+        if layer_class in INSTRUCTION_PRODUCING_LAYERS: #KAI
+            log_layer(layer, uid, node_id) #KAI
         layer.log_stats()
 
         if layer_class in INSTRUCTION_PRODUCING_LAYERS:
