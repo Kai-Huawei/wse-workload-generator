@@ -29,7 +29,9 @@ class Core:
         return str(self.core_id)
 
     def add_instruction(self, tile_op: "TileGemmOp"):
-        self.instruction_queue.append(tile_op)
+        # NOTE: the tile op itself is deliberately NOT stored here (it used to be appended to
+        # self.instruction_queue, which nothing ever read). Keeping it pinned every op together
+        # with its tiles/stats for the whole run, i.e. memory grew with the number of layers.
         # Each tile-op emits Instructions with local ids contiguous from 0.
         # Rebase them to this core's file-wide id space on append, shifting
         # both local_id and local_deps by the same constant offset.
@@ -98,16 +100,62 @@ class Wafer:
                 traces[node_id][core_id] = self.cores[node_id][core_id].get_traces()
         return traces
 
-    def export_traces(self, iter:int, dir_path: str):
-        traces = self.get_traces()
+    def _trace_fname(self, iter, dir_path, node_id, core_id):
+        return dir_path + "/node_{}/{}/core_{}.csv".format(node_id, iter, core_id)
+
+    def flush_traces(self, iter, dir_path: str):
+        """Move the trace lines every core has collected so far to its file and free them.
+
+        The first write to a file in this Wafer's lifetime truncates it (exactly what export_traces
+        did), later writes append, so the final files are identical to a single export at the end.
+        Call it every now and then during generation to keep memory flat instead of holding every
+        rendered instruction of the whole run until export_traces().
+        After a flush, Core.get_traces()/Wafer.get_traces() only return the lines not written yet.
+        """
+        debug = logging.getLogger().isEnabledFor(logging.DEBUG)
         for node_id in range(self.num_nodes):
             for core_id in range(self.num_cores_per_node):
+                core = self.cores[node_id][core_id]
+                if not core.traces:
+                    continue
+                if debug:  # same debug lines export_traces used to print (in flush order, not file order)
+                    for trace in core.traces:
+                        logging.debug("Core {}: {}".format(core_id, trace))
+                self._write_lines(self._trace_fname(iter, dir_path, node_id, core_id), core.traces)
+                core.traces = []
 
-                for trace in traces[node_id][core_id]:
-                    logging.debug("Core {}: {}".format(core_id, trace))
+    def _write_lines(self, fname, lines):
+        started = getattr(self, "_flushed_files", None)
+        if started is None:
+            started = self._flushed_files = set()
+        if fname not in started:
+            folder = os.path.dirname(fname)
+            if not os.path.exists(folder):
+                os.makedirs(folder)
+            mode = "w"
+            started.add(fname)
+        else:
+            mode = "a"
+        with open(fname, mode) as f:
+            f.writelines(line + "\n" for line in lines)
 
-                out_fname = dir_path + "/node_{}/{}/core_{}.csv".format(node_id, iter, core_id)
-                write_to_csv(traces[node_id][core_id], out_fname)
+    def export_traces(self, iter:int, dir_path: str):
+        debug = logging.getLogger().isEnabledFor(logging.DEBUG)
+        for node_id in range(self.num_nodes):
+            for core_id in range(self.num_cores_per_node):
+                core_traces = self.cores[node_id][core_id].get_traces()
+
+                if debug:
+                    for trace in core_traces:
+                        logging.debug("Core {}: {}".format(core_id, trace))
+
+                # every core gets a file, even one with no instructions (an empty file)
+                self._write_lines(self._trace_fname(iter, dir_path, node_id, core_id), core_traces)
+
+        # A later export overwrites the files again with the lines still held in memory. Without
+        # flush_traces() that is everything (the original behaviour); after flushes it is only the
+        # lines added since the last flush, so call export_traces() once, at the end, when flushing.
+        self._flushed_files = set()
 
     def load_traces(self, iter: int, dir_path: str, filter_by_uid: str = None):
         traces = {}

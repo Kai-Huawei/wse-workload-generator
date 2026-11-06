@@ -1,8 +1,11 @@
-
 import csv 
+import sys
 import networkx as nx
 
 class Node:
+    # __slots__: there are hundreds of thousands of these, a per-instance __dict__ is pure overhead
+    __slots__ = ("uid", "node_id", "op_type", "input_tensors", "output_tensors", "parent", "children")
+
     def __init__(self, uid, node_id, op_type, input_tensors, output_tensors, parent) -> None:
         self.uid = uid
         self.node_id = node_id
@@ -58,10 +61,12 @@ class Graph:
             with open(csv_fname, mode="r") as csv_file:
                 csv_reader = csv.DictReader(csv_file, delimiter=";")  # Automatically uses the first row as headers
                 for row in csv_reader:
-                    op_id = row["uid"]
-                    op_type = row["Op Type"]
-                    input_tensors = row["Inputs"][1:-1].replace("'","").split(", ")
-                    output_tensors = row["Outputs"][1:-1].replace("'","").split(", ")
+                    # sys.intern: every tensor uid shows up as an output, as one or more inputs and as an
+                    # edge key; interning keeps a single copy of each string instead of one per mention.
+                    op_id = sys.intern(row["uid"])
+                    op_type = sys.intern(row["Op Type"])
+                    input_tensors = [sys.intern(t) for t in row["Inputs"][1:-1].replace("'","").split(", ")]
+                    output_tensors = [sys.intern(t) for t in row["Outputs"][1:-1].replace("'","").split(", ")]
 
                     ops[node_id][op_id] = {"type": op_type, "inputs": input_tensors, "outputs": output_tensors}
 
@@ -105,6 +110,9 @@ class Graph:
                 for dst_node_id, dst_op_id in self.edges[tensor]["dsts"]:
                     self.graph.add_edge(nodes[src_node_id][src_op_id], nodes[dst_node_id][dst_op_id])
 
+        # the tensor->(srcs, dsts) table has done its job, nothing reads it afterwards
+        self.edges = {}
+
         reachable = nx.descendants(self.graph, self.root) | {self.root}
         missing = set(self.graph.nodes()) - set(reachable)
         assert missing == set(), "Graph contains unreachable nodes."
@@ -126,6 +134,12 @@ class Graph:
     
     def get_topological_order(self):
         return list(nx.topological_sort(self.graph))
+
+    def release_structure(self):
+        """Drop the networkx graph (and edge table). Call it once get_topological_order() has been
+        taken and nothing else needs the structure: get_op() keeps working, the order list keeps its Nodes."""
+        self.graph = None
+        self.edges = {}
 
     def draw_graph(self, filepath="graph.png"):
         import matplotlib.pyplot as plt
@@ -157,4 +171,3 @@ def get_compute_graph():
 
 if __name__=="__main__":
     graph = init_graph("decode0", 4)
-

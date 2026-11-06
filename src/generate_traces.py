@@ -21,6 +21,7 @@ from src.core_level.layers.barrier import Barrier
 
 from src.core_level.common.graph import init_graph
 from src.core_level.common.tile import load_tiling_config
+from src.core_level.common.tensor import TensorRegistry
 from src.Kai_Library.mapping_log import set_output_files, log_layer #KAI
 
 def generate_traces(args):
@@ -313,10 +314,54 @@ def generate_traces(args):
 
     # Run layers from the compute graph in topological order
     topo_queue = graph.get_topological_order()
+    graph.release_structure()  # the networkx graph is only needed to get the order; get_op() still works
 
     # Per-node tracking for cross-layer barriers
     last_producing_uid = {}  # node_id → uid of last instruction-producing layer
     barrier_counter = 0
+
+    # --- Memory management -------------------------------------------------------------------
+    # Everything a layer builds (tensors, memory maps, tiles, tile ops) is only needed while the
+    # layer is being built/logged and, for its output tensors, until their last consumer has run.
+    # Holding all of it until the end made memory grow linearly with the number of layers, so:
+    #   * a tensor is dropped from the registry once the last graph op reading it has been handled
+    #     (weights / partial sums / other internal tensors have no consumer: dropped right away),
+    #   * rendered trace lines are written to the core files after every FLUSH_EVERY
+    #     instruction-producing ops (Linear, Sum, Allreduce, ...) instead of all at the very end.
+    # The generated traces and the mapping logs do not change.
+    FLUSH_EVERY = 64
+    traces_dir = f"{args.outdir}/traces/decode"
+    # A layer normally reads only the tensors of its own graph op. The one exception is Allreduce,
+    # which also reads the input tensor of the op on the next node of its ring.
+    extra_reads = {}
+    for n in topo_queue:
+        entry = layer_attrs.get(n.node_id, {}).get(n.uid)
+        if entry is not None and entry["type"] is AllreduceLayer:
+            group = entry["attrs"]["comm_group"]
+            next_node = group[(group.index(n.node_id) + 1) % len(group)]
+            extra_reads[(n.node_id, n.uid)] = graph.get_op(next_node, n.uid)["inputs"][0]
+
+    def tensors_read(n):
+        extra = extra_reads.get((n.node_id, n.uid))
+        return n.input_tensors if extra is None else list(n.input_tensors) + [extra]
+
+    consumers_left = {}
+    for n in topo_queue:
+        for t in tensors_read(n):
+            consumers_left[t] = consumers_left.get(t, 0) + 1
+    TensorRegistry.track_created(True)
+
+    def release_dead_tensors(n):
+        for t in tensors_read(n):
+            left = consumers_left.get(t, 0) - 1
+            consumers_left[t] = left
+            if left <= 0:
+                TensorRegistry.release(t, guard=True)  # raises later if anything asks for it again
+        for t in TensorRegistry.pop_created():
+            if consumers_left.get(t, 0) <= 0:
+                TensorRegistry.release(t)  # layer-private tensor (weights, partial sums, ...)
+
+    n_producing = 0
 
     for node in topo_queue:
         print(f"Mapping {node.uid} in node_id {node.node_id}")
@@ -328,10 +373,12 @@ def generate_traces(args):
         uid = node.uid
 
         if uid not in layer_attrs[node_id]:
+            release_dead_tensors(node)  # this op will never run, so it will never read its inputs
             continue
 
-        layer_class = layer_attrs[node_id][uid]["type"]
-        layer_params = layer_attrs[node_id][uid]["attrs"]
+        entry = layer_attrs[node_id].pop(uid)
+        layer_class = entry["type"]
+        layer_params = entry["attrs"]
 
         # Insert cross-layer barrier before instruction-producing layers
         if layer_class in INSTRUCTION_PRODUCING_LAYERS:
@@ -350,8 +397,16 @@ def generate_traces(args):
 
         if layer_class in INSTRUCTION_PRODUCING_LAYERS:
             last_producing_uid[node_id] = uid
+            n_producing += 1
 
-    wafer.export_traces(args.iter, f"{args.outdir}/traces/decode")
+        # the layer has been logged: let go of it and of every tensor nobody needs any more
+        del layer, layer_params, entry
+        release_dead_tensors(node)
+        if n_producing and n_producing % FLUSH_EVERY == 0 and layer_class in INSTRUCTION_PRODUCING_LAYERS:
+            wafer.flush_traces(args.iter, traces_dir)
+
+    wafer.export_traces(args.iter, traces_dir)
+    TensorRegistry.track_created(False)  # back to the default for anything that runs afterwards
 
 import argparse
 if __name__=="__main__":

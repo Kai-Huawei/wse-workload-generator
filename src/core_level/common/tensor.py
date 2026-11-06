@@ -9,11 +9,21 @@ def reset_tensor_registry():
 
 class TensorRegistry:
     _registry = {}
+    _created = None  # uids registered since the last pop_created(); None = not tracking (default)
+    _guard = None    # uids released while later layers might still ask for them (see release())
 
     @classmethod
     def register(cls, tensor):
         assert tensor.uid not in cls._registry, f"Tensor with uid {tensor.uid} is already registered."
+        if cls._guard is not None and tensor.uid in cls._guard:
+            # A layer asked for a tensor that was already released: it would silently get a fresh,
+            # unmapped tensor instead of the real one. Fail loudly rather than emit wrong traces.
+            raise RuntimeError(f"Tensor {tensor.uid} was released from the registry but is used again. "
+                               "Some layer reads a tensor that is not one of its graph inputs; "
+                               "add it to the extra reads in generate_traces.py.")
         cls._registry[tensor.uid] = tensor
+        if cls._created is not None:
+            cls._created.append(tensor.uid)
 
     @classmethod
     def get(cls, uid):
@@ -24,8 +34,35 @@ class TensorRegistry:
         return uid in cls._registry
 
     @classmethod
+    def release(cls, uid, guard=False):
+        """Forget a tensor that no later layer will look up (frees its memory map once unreferenced).
+
+        guard=True additionally remembers the uid so that a later attempt to create a tensor with it
+        raises instead of silently producing a new, unmapped tensor (needs track_created()).
+        """
+        if cls._registry.pop(uid, None) is not None and guard and cls._guard is not None:
+            cls._guard.add(uid)
+
+    @classmethod
+    def track_created(cls, enabled=True):
+        """Start (or stop) recording the uids of newly registered tensors, see pop_created()."""
+        cls._created = [] if enabled else None
+        cls._guard = set() if enabled else None
+
+    @classmethod
+    def pop_created(cls):
+        """uids registered since the previous call ([] when tracking is off)."""
+        if cls._created is None:
+            return []
+        created, cls._created = cls._created, []
+        return created
+
+    @classmethod
     def reset(cls):
         cls._registry = {}
+        if cls._created is not None:
+            cls._created = []
+            cls._guard = set()
 
 '''
 Tensor class representing a multi-dimensional array.
